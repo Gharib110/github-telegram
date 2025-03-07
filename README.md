@@ -1,2 +1,2 @@
 # github-telegram
-Clone and Download the specified github repositories code and releases to the Telegram Channel
+Download the specified github repositories source code and releases to the Telegram Channel
