@@ -1,146 +1,155 @@
 import os
+import json
+import hashlib
 import requests
-import time
-import telegram
-import asyncio
+from pathlib import Path
+from telegram import Bot
 
-# Configuration
-GITHUB_TOKEN = "tk"  # Optional for higher API limits
-TELEGRAM_BOT_TOKEN = "tk"
-TELEGRAM_CHANNEL_ID = "@ch"
-REPO_LIST_FILE = "repos.txt"
-TRACK_FILE = "tracked_versions.txt"
-DOWNLOAD_DIR = "./downloads"
+# Telegram Bot Token & Chat ID (Replace with actual values)
+TELEGRAM_BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
+TELEGRAM_CHAT_ID = "YOUR_CHAT_ID"
 
-# Initialize Telegram Bot
-bot = telegram.Bot(token=TELEGRAM_BOT_TOKEN)
+# GitHub API Token (Replace with actual token)
+GITHUB_TOKEN = "YOUR_GITHUB_API_TOKEN"
+HEADERS = {
+    "Accept": "application/vnd.github.v3+json",
+    "Authorization": f"token {GITHUB_TOKEN}"
+}
 
-HEADERS = {"Authorization": f"token {GITHUB_TOKEN}"} if GITHUB_TOKEN else {}
+# File containing the list of repository URLs
+REPOS_FILE = "repos.txt"
+
+# Base directory to store repositories
+BASE_DIR = Path("./github_repos")
+BASE_DIR.mkdir(exist_ok=True)
+
+# File to track last seen versions
+VERSIONS_FILE = BASE_DIR / "versions.json"
+
+# Load previous versions
+if VERSIONS_FILE.exists():
+    with open(VERSIONS_FILE, "r") as f:
+        version_tracking = json.load(f)
+else:
+    version_tracking = {}
+
+# Initialize Telegram bot
+bot = Bot(token=TELEGRAM_BOT_TOKEN)
 
 def get_repo_name(repo_url):
-    return "/".join(repo_url.rstrip("/").split("/")[-2:])
+    """Extract repository name from URL."""
+    return repo_url.rstrip("/").split("/")[-2] + "_" + repo_url.rstrip("/").split("/")[-1]
 
-def get_latest_release(repo_name):
-    url = f"https://api.github.com/repos/{repo_name}/releases/latest"
+def get_latest_commit(repo):
+    """Get the latest commit hash of the default branch."""
+    url = f"https://api.github.com/repos/{repo}/commits/main"
     response = requests.get(url, headers=HEADERS)
-    return response.json() if response.status_code == 200 else None
-
-def get_latest_commit(repo_name):
-    url = f"https://api.github.com/repos/{repo_name}/commits/main"
-    response = requests.get(url, headers=HEADERS)
-    return response.json().get("sha") if response.status_code == 200 else None
-
-def download_file(url, filename):
-    response = requests.get(url, headers=HEADERS, stream=True)
     if response.status_code == 200:
-        with open(filename, "wb") as file:
-            for chunk in response.iter_content(chunk_size=8192):
-                file.write(chunk)
-        return filename
+        return response.json()["sha"]
     return None
 
+def get_latest_release(repo):
+    """Get the latest release version and download URLs."""
+    url = f"https://api.github.com/repos/{repo}/releases/latest"
+    response = requests.get(url, headers=HEADERS)
+    if response.status_code == 200:
+        data = response.json()
+        return data.get("tag_name"), [asset["browser_download_url"] for asset in data.get("assets", [])]
+    return None, []
 
-async def upload_to_telegram_async(file_path):
-    """Handles async file upload properly."""
+def download_file(url, dest_path):
+    """Download a file synchronously and save it."""
+    response = requests.get(url, stream=True)
+    if response.status_code == 200:
+        with open(dest_path, "wb") as f:
+            for chunk in response.iter_content(8192):
+                f.write(chunk)
+
+def calculate_checksum(file_path):
+    """Calculate SHA256 checksum of a file."""
+    sha256 = hashlib.sha256()
+    with open(file_path, "rb") as f:
+        while chunk := f.read(8192):
+            sha256.update(chunk)
+    return sha256.hexdigest()
+
+def send_telegram_message(text):
+    """Send a message to Telegram."""
     try:
-        with open(file_path, "rb") as f:
-            message = await bot.send_document(
-                chat_id=TELEGRAM_CHANNEL_ID, 
-                document=f, 
-                caption=os.path.basename(file_path),
-                timeout=60  # Increase timeout to avoid failure on large files
-            )
-
-        # Ensure successful upload before deleting the file
-        if message and message.document:
-            print(f"✅ Successfully uploaded {file_path}")
-            os.remove(file_path)  # Delete only after confirmation
-        else:
-            print(f"⚠ Upload failed for {file_path}, keeping file.")
+        bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text)
     except Exception as e:
-        print(f"❌ Failed to upload {file_path}: {e}")
+        print(f"⚠️ Failed to send message to Telegram: {e}")
 
-def upload_to_telegram(file_path):
-    """Runs the async function properly without event loop issues."""
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-    
-    loop.run_until_complete(upload_to_telegram_async(file_path))
-
-
-
-def track_version(repo_name, release_version, commit_sha):
-    tracked_versions = load_tracked_versions()
-    tracked_versions[repo_name] = f"{release_version} {commit_sha}"
-    with open(TRACK_FILE, "w") as f:
-        for repo, ver in tracked_versions.items():
-            f.write(f"{repo} {ver}\n")
-
-def load_tracked_versions():
-    if not os.path.exists(TRACK_FILE):
-        return {}
-    with open(TRACK_FILE, "r") as f:
-        return dict(line.strip().split(" ", 1) for line in f if " " in line)
-
-def process_repository(repo_url):
+def track_repository(repo_url):
+    """Track a GitHub repository, download latest code/releases, and store versions."""
     repo_name = get_repo_name(repo_url)
-    tracked_versions = load_tracked_versions()
+    repo_path = BASE_DIR / repo_name
+    repo_path.mkdir(exist_ok=True)
 
-    latest_commit = get_latest_commit(repo_name)
-    if not latest_commit:
-        print(f"⚠ Failed to fetch commit data for {repo_name}")
-        return
+    owner_repo = "/".join(repo_url.rstrip("/").split("/")[-2:])
 
-    release = get_latest_release(repo_name)
-    latest_release_version = release["tag_name"] if release else "none"
+    # Get latest commit hash
+    latest_commit = get_latest_commit(owner_repo)
 
-    last_version, last_commit = tracked_versions.get(repo_name, "none none").split()
+    # Get latest release
+    latest_version, release_urls = get_latest_release(owner_repo)
 
-    # Download and upload updated source code
-    if last_commit != latest_commit:
-        print(f"📥 New commit detected for {repo_name}, downloading source code...")
-        zip_url = f"https://github.com/{repo_name}/archive/refs/heads/main.zip"
-        zip_filename = os.path.join(DOWNLOAD_DIR, f"{repo_name.replace('/', '_')}_source.zip")
-        
-        file_path = download_file(zip_url, zip_filename)
-        if file_path:
-            print(f"📤 Uploading {zip_filename} to Telegram...")
-            upload_to_telegram(file_path)
+    updated = False
+    message = f"🚀 **Repository Updated: {repo_name}**\n"
 
-    # Download and upload updated release binaries
-    if latest_release_version != "none" and last_version != latest_release_version:
-        print(f"📥 New release detected for {repo_name}: {latest_release_version}")
-        for asset in release.get("assets", []):
-            url = asset["browser_download_url"]
-            filename = os.path.join(DOWNLOAD_DIR, asset["name"])
-            print(f"📥 Downloading {filename}...")
+    # Store latest source code (if updated)
+    if latest_commit and version_tracking.get(repo_name, {}).get("commit") != latest_commit:
+        zip_url = f"https://github.com/{owner_repo}/archive/refs/heads/main.zip"
+        zip_path = repo_path / "source.zip"
+        print(f"📥 Downloading latest source for {repo_name}...")
+        download_file(zip_url, zip_path)
+        version_tracking.setdefault(repo_name, {})["commit"] = latest_commit
+        message += f"🔹 **New Commit:** {latest_commit[:7]}\n"
+        updated = True
 
-            file_path = download_file(url, filename)
-            if file_path:
-                print(f"📤 Uploading {filename} to Telegram...")
-                upload_to_telegram(file_path)
+    # Store latest release files (if updated)
+    if latest_version and version_tracking.get(repo_name, {}).get("release") != latest_version:
+        for url in release_urls:
+            file_name = url.split("/")[-1]
+            file_path = repo_path / file_name
+            print(f"📥 Downloading release: {file_name}...")
+            download_file(url, file_path)
+        version_tracking[repo_name]["release"] = latest_version
+        message += f"📦 **New Release:** {latest_version}\n"
+        updated = True
 
-    track_version(repo_name, latest_release_version, latest_commit)
+    # Generate checksum file
+    if updated:
+        checksums_path = repo_path / "checksums.txt"
+        with open(checksums_path, "w") as f:
+            for file in repo_path.iterdir():
+                if file.is_file():
+                    checksum = calculate_checksum(file)
+                    f.write(f"{file.name}: {checksum}\n")
+        print(f"✅ Checksums updated for {repo_name}")
+
+        # Send Telegram notification
+        send_telegram_message(message)
+
+    # Save version tracking
+    with open(VERSIONS_FILE, "w") as f:
+        json.dump(version_tracking, f, indent=4)
+
+def load_repositories():
+    """Load repository URLs from repos.txt file."""
+    if not os.path.exists(REPOS_FILE):
+        print(f"⚠️ {REPOS_FILE} not found. Creating an empty one.")
+        with open(REPOS_FILE, "w") as f:
+            f.write("")
+        return []
+
+    with open(REPOS_FILE, "r") as f:
+        return [line.strip() for line in f if line.strip()]
 
 def main():
-    if not os.path.exists(REPO_LIST_FILE):
-        print(f"Error: {REPO_LIST_FILE} not found!")
-        return
-
-    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-
-    with open(REPO_LIST_FILE, "r") as f:
-        repos = [line.strip() for line in f if line.strip()]
-
-    for repo_url in repos:
-        print(f"\n🔍 Checking {repo_url}...")
-        process_repository(repo_url)
+    repositories = load_repositories()
+    for repo in repositories:
+        track_repository(repo)
 
 if __name__ == "__main__":
-    while True:
-        main()
-        print("\nFinished\n")
- 
+    main()
